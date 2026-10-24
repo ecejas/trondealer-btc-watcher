@@ -2,10 +2,10 @@ import { after, before, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
-import type { AddressInfo } from 'node:net';
 import { address as btcAddress, Block, payments, Transaction } from 'bitcoinjs-lib';
 import type { PaymentEvent } from '../src/types.js';
 
+// El logger lee el entorno al importarse: sin pino-pretty ni logs en los tests
 process.env.NODE_ENV = 'production';
 process.env.LOG_LEVEL = 'silent';
 const { handleRawBlock, handleRawTx } = await import('../src/zmq.js');
@@ -27,12 +27,15 @@ before(async () => {
     req.on('data', chunk => { body += chunk; });
     req.on('end', () => {
       const expected = `sha256=${createHmac('sha256', SECRET).update(body).digest('hex')}`;
-      received.push({ ...JSON.parse(body), validSignature: req.headers['x-webhook-signature'] === expected });
+      const event: PaymentEvent = JSON.parse(body);
+      received.push({ ...event, validSignature: req.headers['x-webhook-signature'] === expected });
       res.end('ok');
     });
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
-  callbackUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/hook`;
+  const bound = server.address();
+  assert.ok(bound && typeof bound === 'object', 'server did not bind a TCP port');
+  callbackUrl = `http://127.0.0.1:${bound.port}/hook`;
 });
 
 after(() => server.close());
@@ -42,17 +45,19 @@ beforeEach(() => {
   for (const watch of store.list()) store.remove(watch.id);
 });
 
-const paymentTx = (sats: bigint) => {
+const paymentTx = (sats: bigint): Transaction => {
+  const memo = payments.embed({ data: [new TextEncoder().encode('memo')] }).output;
+  assert.ok(memo);
   const tx = new Transaction();
   tx.addInput(new Uint8Array(32).fill(7), 0);
-  tx.addOutput(payments.embed({ data: [new TextEncoder().encode('memo')] }).output!, 0n);
+  tx.addOutput(memo, 0n);
   tx.addOutput(btcAddress.toOutputScript(OTHER), 5_000n);
   tx.addOutput(btcAddress.toOutputScript(WATCHED), sats);
   return tx;
 };
 
 let height = 0;
-const blockWith = (txs: Transaction[]) => {
+const blockWith = (txs: Transaction[]): Buffer => {
   const coinbase = new Transaction();
   coinbase.addInput(new Uint8Array(32), 0xffffffff, 0xffffffff, new Uint8Array([height & 0xff, height >> 8]));
   coinbase.addOutput(btcAddress.toOutputScript(OTHER), 312_500_000n);
@@ -77,8 +82,11 @@ describe('handleRawTx', () => {
     await handleRawTx(Buffer.from(tx.toBuffer()));
 
     assert.equal(received.length, 1);
+    const [detected] = received;
+    assert.ok(detected);
+    const { event, watch_id, txid, amount_sats, confirmations, validSignature } = detected;
     assert.deepEqual(
-      { event: received[0].event, watch_id: received[0].watch_id, txid: received[0].txid, amount_sats: received[0].amount_sats, confirmations: received[0].confirmations, validSignature: received[0].validSignature },
+      { event, watch_id, txid, amount_sats, confirmations, validSignature },
       { event: 'mempool_detected', watch_id: id, txid: tx.getId(), amount_sats: 150_000, confirmations: 0, validSignature: true },
     );
     assert.equal(store.get(id)?.status, 'detected_mempool');
