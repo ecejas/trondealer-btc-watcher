@@ -3,6 +3,7 @@ import { address as btcAddress, Block, Transaction } from 'bitcoinjs-lib';
 import { logger } from './logger.js';
 import { store } from './store.js';
 import { sendWebhook } from './webhook.js';
+import type { WatchedAddress } from './types.js';
 
 const BITCOIND_ZMQ_RAWTX = process.env.BITCOIND_ZMQ_RAWTX || 'tcp://bitcoind:28333';
 const BITCOIND_ZMQ_RAWBLOCK = process.env.BITCOIND_ZMQ_RAWBLOCK || 'tcp://bitcoind:28332';
@@ -68,14 +69,20 @@ export async function handleRawBlock(rawBlock: Buffer) {
   const txids = new Set((block.transactions ?? []).map(tx => tx.getId()));
   logger.debug({ blockHash, txCount: txids.size }, 'new block');
 
-  for (const watch of store.list()) {
-    if (watch.status !== 'detected_mempool' || !watch.detected_txid) continue;
+  // La primera confirmación es el bloque que incluye la tx; cada bloque posterior suma una
+  const needsThisBlock = (watch: WatchedAddress) =>
+    watch.status === 'detected_mempool' && !!watch.detected_txid
+    && ((watch.confirmations ?? 0) > 0 || txids.has(watch.detected_txid));
 
-    // La primera confirmación es el bloque que incluye la tx; cada bloque posterior suma una
-    const confirmations = watch.confirmations ?? 0;
-    if (confirmations === 0 && !txids.has(watch.detected_txid)) continue;
+  // El store se relee tras cada webhook: mientras se espera uno, el bucle de rawtx puede
+  // detectar otro pago de este mismo bloque, y una copia previa lo seguiría viendo pending
+  const handled = new Set<string>();
+  for (;;) {
+    const watch = store.list().find(w => !handled.has(w.id) && needsThisBlock(w));
+    if (!watch?.detected_txid) break;
+    handled.add(watch.id);
 
-    const newConfs = confirmations + 1;
+    const newConfs = (watch.confirmations ?? 0) + 1;
     store.update(watch.id, {
       confirmations: newConfs,
       status: newConfs >= CONFIRMATIONS_TARGET ? 'confirmed' : 'detected_mempool',

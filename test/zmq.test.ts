@@ -12,6 +12,7 @@ const { handleRawBlock, handleRawTx } = await import('../src/zmq.js');
 const { store } = await import('../src/store.js');
 
 const WATCHED = 'bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh';
+const WATCHED_B = 'bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq';
 const OTHER = '1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2';
 const SECRET = 'per-watch-secret';
 
@@ -45,14 +46,14 @@ beforeEach(() => {
   for (const watch of store.list()) store.remove(watch.id);
 });
 
-const paymentTx = (sats: bigint): Transaction => {
+const paymentTx = (sats: bigint, to: string = WATCHED, seed = 7): Transaction => {
   const memo = payments.embed({ data: [new TextEncoder().encode('memo')] }).output;
   assert.ok(memo);
   const tx = new Transaction();
-  tx.addInput(new Uint8Array(32).fill(7), 0);
+  tx.addInput(new Uint8Array(32).fill(seed), 0);
   tx.addOutput(memo, 0n);
   tx.addOutput(btcAddress.toOutputScript(OTHER), 5_000n);
-  tx.addOutput(btcAddress.toOutputScript(WATCHED), sats);
+  tx.addOutput(btcAddress.toOutputScript(to), sats);
   return tx;
 };
 
@@ -72,7 +73,7 @@ const blockWith = (txs: Transaction[]): Buffer => {
   return Buffer.from(block.toBuffer());
 };
 
-const watch = () => store.add({ address: WATCHED, expected_sats: 150_000, callback_url: callbackUrl, hmac_secret: SECRET, expires_at: Date.now() + 60_000 });
+const watch = (address: string = WATCHED) => store.add({ address, expected_sats: 150_000, callback_url: callbackUrl, hmac_secret: SECRET, expires_at: Date.now() + 60_000 });
 
 describe('handleRawTx', () => {
   it('fires a signed mempool_detected webhook for a payment to a watched address', async () => {
@@ -121,5 +122,27 @@ describe('handleRawBlock', () => {
     assert.ok(confirmations.every(e => e.txid === tx.getId() && e.amount_sats === 150_000 && e.validSignature));
     assert.equal(store.get(id)?.status, 'confirmed');
     assert.equal(store.get(id)?.confirmations, 6);
+  });
+
+  it('counts the inclusion of a payment detected while it was awaiting another watch\'s webhook', async () => {
+    const a = watch();
+    const b = watch(WATCHED_B);
+    const txA = paymentTx(150_000n);
+    const txB = paymentTx(90_000n, WATCHED_B, 8);
+    await handleRawTx(Buffer.from(txA.toBuffer()));
+
+    // The block holding both txs starts; while it awaits A's confirmation webhook, the
+    // independent rawtx loop detects B (its rawtx can arrive after the block)
+    const inclusion = handleRawBlock(blockWith([txA, txB]));
+    await handleRawTx(Buffer.from(txB.toBuffer()));
+    await inclusion;
+    for (let i = 0; i < 5; i++) await handleRawBlock(blockWith([]));
+
+    const confirmationsOf = (watchId: string) => received
+      .filter(e => e.event === 'confirmation' && e.watch_id === watchId)
+      .map(e => e.confirmations);
+    assert.deepEqual(confirmationsOf(a.id), [1, 2, 3, 4, 5, 6]);
+    assert.deepEqual(confirmationsOf(b.id), [1, 2, 3, 4, 5, 6]);
+    assert.equal(store.get(b.id)?.status, 'confirmed');
   });
 });
