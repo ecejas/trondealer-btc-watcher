@@ -46,7 +46,9 @@ beforeEach(() => {
   for (const watch of store.list()) store.remove(watch.id);
 });
 
-const paymentTx = (sats: bigint, to: string = WATCHED, seed = 7): Transaction => {
+// Each call spends a different input, so every test's payment has its own txid
+let txSeed = 1;
+const paymentTx = (sats: bigint, to: string = WATCHED, seed = txSeed++): Transaction => {
   const memo = payments.embed({ data: [new TextEncoder().encode('memo')] }).output;
   assert.ok(memo);
   const tx = new Transaction();
@@ -57,19 +59,26 @@ const paymentTx = (sats: bigint, to: string = WATCHED, seed = 7): Transaction =>
   return tx;
 };
 
-let height = 0;
-const blockWith = (txs: Transaction[]): Buffer => {
+// Blocks form a real chain with BIP34 heights: each one points at `tip` (or at `parent`, to
+// fork) one height above it, and becomes the new tip
+const hex = (hash: Uint8Array) => Buffer.from(hash).toString('hex');
+const heights = new Map<string, number>();
+let tip: Uint8Array = new Uint8Array(32);
+const blockWith = (txs: Transaction[], parent: Uint8Array = tip): Buffer => {
+  const height = (heights.get(hex(parent)) ?? 899_999) + 1;
   const coinbase = new Transaction();
-  coinbase.addInput(new Uint8Array(32), 0xffffffff, 0xffffffff, new Uint8Array([height & 0xff, height >> 8]));
+  coinbase.addInput(new Uint8Array(32), 0xffffffff, 0xffffffff, new Uint8Array([3, height & 0xff, (height >> 8) & 0xff, (height >> 16) & 0xff]));
   coinbase.addOutput(btcAddress.toOutputScript(OTHER), 312_500_000n);
   const block = new Block();
   block.version = 0x20000000;
-  block.prevHash = new Uint8Array(32);
+  block.prevHash = parent;
   block.timestamp = 1_790_000_000 + height * 600;
   block.bits = 0x1d00ffff;
-  block.nonce = height++;
+  block.nonce = height;
   block.transactions = [coinbase, ...txs];
   block.merkleRoot = Block.calculateMerkleRoot(block.transactions);
+  tip = block.getHash();
+  heights.set(hex(tip), height);
   return Buffer.from(block.toBuffer());
 };
 
@@ -128,7 +137,7 @@ describe('handleRawBlock', () => {
     const a = watch();
     const b = watch(WATCHED_B);
     const txA = paymentTx(150_000n);
-    const txB = paymentTx(90_000n, WATCHED_B, 8);
+    const txB = paymentTx(90_000n, WATCHED_B);
     await handleRawTx(Buffer.from(txA.toBuffer()));
 
     // The block holding both txs starts; while it awaits A's confirmation webhook, the
@@ -144,5 +153,80 @@ describe('handleRawBlock', () => {
     assert.deepEqual(confirmationsOf(a.id), [1, 2, 3, 4, 5, 6]);
     assert.deepEqual(confirmationsOf(b.id), [1, 2, 3, 4, 5, 6]);
     assert.equal(store.get(b.id)?.status, 'confirmed');
+  });
+
+  it('never confirms a payment whose block was orphaned by a reorg', async () => {
+    const { id } = watch();
+    const tx = paymentTx(150_000n);
+    await handleRawTx(Buffer.from(tx.toBuffer()));
+
+    await handleRawBlock(blockWith([])); // a block the watcher has seen, to fork from
+    const forkPoint = tip;
+    await handleRawBlock(blockWith([tx]));
+    // A competing branch from the same parent, without the payment, becomes the active chain
+    await handleRawBlock(blockWith([], forkPoint));
+    for (let i = 0; i < 5; i++) await handleRawBlock(blockWith([]));
+
+    const confirmations = received.filter(e => e.event === 'confirmation').map(e => e.confirmations);
+    assert.deepEqual(confirmations, [1, 0]);
+    assert.equal(store.get(id)?.status, 'detected_mempool');
+    assert.equal(store.get(id)?.confirmations, 0);
+  });
+
+  it('counts a payment re-mined on the new branch after a reorg', async () => {
+    const { id } = watch();
+    const tx = paymentTx(150_000n);
+    await handleRawTx(Buffer.from(tx.toBuffer()));
+
+    await handleRawBlock(blockWith([])); // a block the watcher has seen, to fork from
+    const forkPoint = tip;
+    await handleRawBlock(blockWith([tx]));
+    await handleRawBlock(blockWith([], forkPoint));
+    await handleRawBlock(blockWith([tx]));
+    for (let i = 0; i < 5; i++) await handleRawBlock(blockWith([]));
+
+    const confirmations = received.filter(e => e.event === 'confirmation').map(e => e.confirmations);
+    assert.deepEqual(confirmations, [1, 0, 1, 2, 3, 4, 5, 6]);
+    assert.equal(store.get(id)?.status, 'confirmed');
+  });
+
+  it('counts a payment whose rawtx arrives after its block was processed', async () => {
+    const { id } = watch();
+    const tx = paymentTx(150_000n);
+
+    await handleRawBlock(blockWith([tx]));
+    await handleRawTx(Buffer.from(tx.toBuffer()));
+    for (let i = 0; i < 5; i++) await handleRawBlock(blockWith([]));
+
+    const confirmations = received.filter(e => e.event === 'confirmation').map(e => e.confirmations);
+    assert.deepEqual(confirmations, [2, 3, 4, 5, 6]);
+    assert.equal(store.get(id)?.status, 'confirmed');
+  });
+
+  it('leaves the count unchanged across a missed block notification instead of guessing', async () => {
+    const { id } = watch();
+    const tx = paymentTx(150_000n);
+    await handleRawTx(Buffer.from(tx.toBuffer()));
+
+    await handleRawBlock(blockWith([tx]));
+    blockWith([]); // mined, but its notification never reaches the watcher
+    await handleRawBlock(blockWith([]));
+
+    assert.deepEqual(received.filter(e => e.event === 'confirmation').map(e => e.confirmations), [1]);
+    assert.equal(store.get(id)?.confirmations, 1);
+    assert.equal(store.get(id)?.status, 'detected_mempool');
+  });
+
+  it('does not count the same block twice', async () => {
+    const { id } = watch();
+    const tx = paymentTx(150_000n);
+    await handleRawTx(Buffer.from(tx.toBuffer()));
+
+    const inclusion = blockWith([tx]);
+    await handleRawBlock(inclusion);
+    await handleRawBlock(inclusion);
+
+    assert.deepEqual(received.filter(e => e.event === 'confirmation').map(e => e.confirmations), [1]);
+    assert.equal(store.get(id)?.confirmations, 1);
   });
 });
